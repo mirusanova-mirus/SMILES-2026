@@ -9,25 +9,28 @@ Strict black-box optimizer:
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List
+from typing import Callable, List
 
 import torch
 import torch.nn as nn
 
 
 class ZeroOrderOptimizer:
-    """Black-box optimizer for fine-tuning a low-dimensional head parameterization."""
+    """Black-box optimizer for a low-dimensional calibration of the classifier head."""
 
     def __init__(
         self,
         model: nn.Module,
         lr: float = 5e-3,
-        eps: float = 1e-2,
+        eps: float = 5e-2,
         perturbation_mode: str = "gaussian",
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
+
+        for param in self.model.parameters():
+            param.requires_grad_(False)
 
         if perturbation_mode not in ("gaussian", "uniform"):
             raise ValueError(
@@ -36,121 +39,141 @@ class ZeroOrderOptimizer:
             )
         self.perturbation_mode = perturbation_mode
 
-        self.layer_names: List[str] = ["fc.bias"]
+        self.layer_names: List[str] = ["fc.weight", "fc.bias"]
 
-        self.K: int = 2
-        self.q: int = 32
-
+        self.K: int = 1
+        self.q: int = 1
         self.beta1: float = 0.9
         self.beta2: float = 0.999
         self.eps_adam: float = 1e-8
-        self.grad_clip: float = 10.0
-        self._m: Dict[str, torch.Tensor] = {}
-        self._v: Dict[str, torch.Tensor] = {}
+        self.scale_clip: float = 0.5
+        self.bias_clip: float = 2.0
+        self.accept_reject: bool = True
+
+        fc = self._fc_layer()
+        self._base_weight = fc.weight.detach().clone()
+        self._base_bias = fc.bias.detach().clone()
+
+        self._log_scale = torch.zeros(fc.out_features, device=fc.weight.device, dtype=fc.weight.dtype)
+        self._bias_shift = torch.zeros_like(self._base_bias)
+
+        self._m_scale = torch.zeros_like(self._log_scale)
+        self._v_scale = torch.zeros_like(self._log_scale)
+        self._m_bias = torch.zeros_like(self._bias_shift)
+        self._v_bias = torch.zeros_like(self._bias_shift)
         self._t: int = 0
 
-        self.reset_adam_per_batch: bool = True
+        self._apply_latent()
 
-    def _active_params(self) -> Dict[str, nn.Parameter]:
-        named = dict(self.model.named_parameters())
-        missing = [n for n in self.layer_names if n not in named]
-        if missing:
-            raise KeyError(
-                f"The following layer names were not found in the model: "
-                f"{missing}. Use [n for n, _ in model.named_parameters()] "
-                f"to inspect valid names."
-            )
-        return {n: named[n] for n in self.layer_names}
+    def _fc_layer(self) -> nn.Linear:
+        fc = getattr(self.model, "fc", None)
+        if not isinstance(fc, nn.Linear):
+            raise TypeError("ZeroOrderOptimizer expects model.fc to be nn.Linear")
+        return fc
+
+    def _apply_latent(
+        self,
+        log_scale: torch.Tensor | None = None,
+        bias_shift: torch.Tensor | None = None,
+    ) -> None:
+        fc = self._fc_layer()
+        log_scale = self._log_scale if log_scale is None else log_scale
+        bias_shift = self._bias_shift if bias_shift is None else bias_shift
+
+        with torch.no_grad():
+            fc.weight.copy_(self._base_weight * torch.exp(log_scale).unsqueeze(1))
+            fc.bias.copy_(self._base_bias + bias_shift)
 
     def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(param).bernoulli_(0.5).mul_(2.0).sub_(1.0)
 
-    def _estimate_grad(
-        self,
-        loss_fn: Callable[[], float],
-        params: Dict[str, nn.Parameter],
-    ) -> Dict[str, torch.Tensor]:
-        grads = {n: torch.zeros_like(p) for n, p in params.items()}
+    def _estimate_grad(self, loss_fn: Callable[[], float]) -> tuple[torch.Tensor, torch.Tensor]:
+        grad_scale = torch.zeros_like(self._log_scale)
+        grad_bias = torch.zeros_like(self._bias_shift)
+
         with torch.no_grad():
             for _ in range(self.q):
-                us = {n: self._sample_direction(p) for n, p in params.items()}
+                u_scale = self._sample_direction(self._log_scale)
+                u_bias = self._sample_direction(self._bias_shift)
 
-                for n, p in params.items():
-                    p.data.add_(us[n], alpha=self.eps)
+                self._apply_latent(
+                    log_scale=(self._log_scale + self.eps * u_scale).clamp(-self.scale_clip, self.scale_clip),
+                    bias_shift=(self._bias_shift + self.eps * u_bias).clamp(-self.bias_clip, self.bias_clip),
+                )
                 f_plus = loss_fn()
 
-                for n, p in params.items():
-                    p.data.add_(us[n], alpha=-2.0 * self.eps)
+                self._apply_latent(
+                    log_scale=(self._log_scale - self.eps * u_scale).clamp(-self.scale_clip, self.scale_clip),
+                    bias_shift=(self._bias_shift - self.eps * u_bias).clamp(-self.bias_clip, self.bias_clip),
+                )
                 f_minus = loss_fn()
 
-                for n, p in params.items():
-                    p.data.add_(us[n], alpha=self.eps)
-
                 coeff = (f_plus - f_minus) / (2.0 * self.eps)
-                for n, u in us.items():
-                    grads[n].add_(u, alpha=coeff)
+                grad_scale.add_(u_scale, alpha=coeff)
+                grad_bias.add_(u_bias, alpha=coeff)
 
-            for n in grads:
-                grads[n].div_(self.q)
-        return grads
+            grad_scale.div_(self.q)
+            grad_bias.div_(self.q)
 
-    def _update_params(
-        self,
-        params: Dict[str, nn.Parameter],
-        grads: Dict[str, torch.Tensor],
-    ) -> None:
+        self._apply_latent()
+        return grad_scale, grad_bias
+
+    def _adam_update(self, grad_scale: torch.Tensor, grad_bias: torch.Tensor) -> None:
         self._t += 1
         bc1 = 1.0 - self.beta1 ** self._t
         bc2 = 1.0 - self.beta2 ** self._t
+
         with torch.no_grad():
-            for name, p in params.items():
-                g = grads[name]
-                gn = g.norm()
-                if gn > self.grad_clip and gn > 0:
-                    g = g * (self.grad_clip / gn)
+            self._m_scale.mul_(self.beta1).add_(grad_scale, alpha=1.0 - self.beta1)
+            self._v_scale.mul_(self.beta2).addcmul_(grad_scale, grad_scale, value=1.0 - self.beta2)
+            self._m_bias.mul_(self.beta1).add_(grad_bias, alpha=1.0 - self.beta1)
+            self._v_bias.mul_(self.beta2).addcmul_(grad_bias, grad_bias, value=1.0 - self.beta2)
 
-                if name not in self._m:
-                    self._m[name] = torch.zeros_like(p)
-                    self._v[name] = torch.zeros_like(p)
-                m = self._m[name].mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
-                v = self._v[name].mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+            m_scale_hat = self._m_scale / bc1
+            v_scale_hat = self._v_scale / bc2
+            m_bias_hat = self._m_bias / bc1
+            v_bias_hat = self._v_bias / bc2
 
-                m_hat = m / bc1
-                denom = (v / bc2).sqrt_().add_(self.eps_adam)
-                p.data.addcdiv_(m_hat, denom, value=-self.lr)
+            self._log_scale.sub_(self.lr * m_scale_hat / (v_scale_hat.sqrt() + self.eps_adam))
+            self._bias_shift.sub_(self.lr * m_bias_hat / (v_bias_hat.sqrt() + self.eps_adam))
+
+            self._log_scale.clamp_(-self.scale_clip, self.scale_clip)
+            self._bias_shift.clamp_(-self.bias_clip, self.bias_clip)
 
     def step(self, loss_fn: Callable[[], float]) -> float:
-        if self.reset_adam_per_batch:
-            self._m = {}
-            self._v = {}
-            self._t = 0
-
-        params = self._active_params()
         with torch.no_grad():
             loss_curr = float(loss_fn())
-        loss_initial = loss_curr
 
         for _ in range(self.K):
-            p_snap = {n: p.data.clone() for n, p in params.items()}
-            m_snap = {n: self._m[n].clone() for n in params if n in self._m}
-            v_snap = {n: self._v[n].clone() for n in params if n in self._v}
-            t_snap = self._t
+            snap = (
+                self._log_scale.clone(),
+                self._bias_shift.clone(),
+                self._m_scale.clone(),
+                self._v_scale.clone(),
+                self._m_bias.clone(),
+                self._v_bias.clone(),
+                self._t,
+            )
 
-            grads = self._estimate_grad(loss_fn, params)
-            self._update_params(params, grads)
+            grad_scale, grad_bias = self._estimate_grad(loss_fn)
+            self._adam_update(grad_scale, grad_bias)
+            self._apply_latent()
 
             with torch.no_grad():
                 loss_new = float(loss_fn())
-            if loss_new < loss_curr:
+
+            if not self.accept_reject or loss_new < loss_curr:
                 loss_curr = loss_new
             else:
-                with torch.no_grad():
-                    for n, p in params.items():
-                        p.data.copy_(p_snap[n])
-                    for n, m_old in m_snap.items():
-                        self._m[n].copy_(m_old)
-                    for n, v_old in v_snap.items():
-                        self._v[n].copy_(v_old)
-                self._t = t_snap
+                (
+                    self._log_scale,
+                    self._bias_shift,
+                    self._m_scale,
+                    self._v_scale,
+                    self._m_bias,
+                    self._v_bias,
+                    self._t,
+                ) = snap
+                self._apply_latent()
 
-        return loss_initial
+        return loss_curr

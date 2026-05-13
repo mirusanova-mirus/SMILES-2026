@@ -42,7 +42,6 @@ def get_transforms(train: bool) -> T.Compose:
         return T.Compose(
             [
                 T.Resize(224),
-                T.RandomHorizontalFlip(p=0.5),
                 T.ToTensor(),
                 T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
             ]
