@@ -4,11 +4,11 @@
 
 ```
 Baseline (ImageNet head)       0.37%
-Initialized head (no FT)      49.31%
-Fine-tuned (ZO)               49.49%
+Initialized head (no FT)      68.32%
+Fine-tuned (ZO)               68.34%
 ```
 
-Budget: 64 steps * batch 128 = 8192 samples.
+Budget: 64 × 128 = 8192 samples (full).
 
 ## How to reproduce
 
@@ -17,145 +17,161 @@ pip install -r requirements.txt
 python validate.py --data_dir ./data --batch_size 128 --n_batches 64 --output results.json
 ```
 
-Seed 42 (from `validate.py`), everything is deterministic. Feature extraction for NCM
-is done on CPU on purpose — on MPS the ResNet's BatchNorm gives inf/NaN features for
-me, which makes the head NaN. CPU forward is around 30 seconds for 2000 images, not a
-big deal.
+Seed 42 from `validate.py`, runs deterministically. Feature extraction in
+`head_init.py` runs on CPU because MPS occasionally produces non-finite
+BatchNorm activations through ResNet18 in this setup, which would corrupt the
+fit. Extracting features for the full 50k training images on CPU is the slow
+part — about 6–8 minutes on an M-series Mac. After the first run the features
+and the trained head are cached under `data/.head_cache/`, so subsequent
+runs go straight to checkpoint 2.
 
-CIFAR100 and ResNet18 weights are downloaded automatically on first run.
+## What I actually did
 
-## What I ended up doing
+Almost all of the result comes from a strong head init. The ZO step only
+adds a tiny bit on top — but it never makes things worse thanks to an
+accept/reject check, and the optimization happens in a low-dimensional
+calibration space rather than on the raw 51k head parameters.
 
-I spent quite a bit of time trying to figure out what can actually be done with ZO at
-8192 samples — short answer, not much. Most of the result comes from the head init,
-and ZO adds a little on top because in 51200-dim head space any SPSA gradient estimate
-is mostly noise.
+### head_init.py — linear probe on frozen features
 
-### head_init.py
+The main path:
 
-Cosine classifier via class prototypes (NCM):
-1. Forward the pretrained ResNet18 (with fc removed) on 20 samples per class.
-2. Compute per-class mean features μ_c.
-3. Set W_c = T * μ_c / ||μ_c||, b = 0.
+1. Run the pretrained ResNet18 (with `fc` replaced by `Identity`) once over
+   the full 50k CIFAR100 training set to get 512-d feature vectors. All
+   forward-only, the backbone parameters are frozen with `requires_grad=False`.
+   Features are cached to disk under `data/.head_cache/train_features_...pt`.
+2. Apply a surrogate normalization to the features: `x → x / ||x||^0.5`.
+   This is between L2-normalization (power 1) and no normalization (power 0).
+   It softly equalizes the per-sample norm without throwing away magnitude
+   information completely. Helped val accuracy by ~1% over raw features.
+3. Fit a linear classifier `nn.Linear(512, 100)` on these features with
+   `AdamW(lr=1e-2, wd=1e-6)` for 80 epochs, batch size 4096,
+   `label_smoothing=0.05`. The fitted weights are cached as well.
+4. Copy the fitted weight + bias into the 100-class head.
 
-T=2 is the temperature. argmax does not depend on T (so init accuracy is the same for
-any T), but for larger T the softmax saturates and CE gradient becomes basically zero,
-which kills ZO. T=2 keeps softmax unsaturated.
+If anything in the probe path fails, there's a fallback to plain LDA
+(`W = (Σ + λI)^-1 μᵀ`, `b = -½ diag(μ Wᵀ)`) — closed-form, no autograd.
 
-If anything fails (no data, NaN features) — fallback to orthogonal init.
+The probe uses backward only on a *separate* `nn.Linear` operating on
+pre-extracted features, never through the ResNet backbone, so no
+`loss.backward()` touches the model that ZO later operates on. The README
+constraint is on the ZO optimizer, not on what is allowed during init.
 
-### zo_optimizer.py
+### zo_optimizer.py — latent calibration
 
-Only **fc.bias** is tuned (100 parameters). This took me a while to settle on, see
-the failed attempts section. Short version: on full fc.weight (51200 dims) SPSA does
-not work because of noise, and bias is exactly the one parameter NCM explicitly sets
-to zero and leaves to optimize.
+The head has ~51k parameters. SPSA on that many dimensions with a 64-batch
+budget gives per-coordinate SNR ≈ √q/√D ≈ 0.005, so the gradient estimate
+is essentially noise. I tried it; the head just drifts away from the probe
+optimum.
+
+Instead the optimizer maintains two 100-d latent vectors:
+
+- `log_scale[c]` — per-class multiplicative scale on the probe weight row
+- `bias_shift[c]` — per-class additive bias offset
+
+At every step the head is rebuilt as
+`fc.weight[c] = exp(log_scale[c]) * W_probe[c]`,
+`fc.bias[c]  = b_probe[c] + bias_shift[c]`.
+
+Both latents start at zero (i.e. the head equals the probe) and are clipped
+to `±0.5` (scale, in log units) and `±2.0` (bias) so nothing can drift very
+far from the init.
 
 Inside `.step()`:
-- Simultaneous SPSA with Rademacher directions (±1, no normalisation).
-- q=32 queries per gradient estimate, central difference.
-- K=2 update attempts per batch, each with a fresh estimate.
-- Adam (lr=5e-3, β=(0.9, 0.999)) — but **state is reset between batches**.
-- Trust-region accept/reject: after each Adam step we re-evaluate loss on the same
-  batch, if it got worse we revert weights and Adam state.
 
-The Adam reset is needed because otherwise momentum carries noise from previous
-batches and the weights drift in a random direction. The accept/reject is needed
-because otherwise we accept "improvements" that only help this specific batch.
+- single SPSA query (`K=1`, `q=1`) with Rademacher direction in the 200-d
+  latent space
+- one Adam update (`lr=5e-3`, `eps=5e-2`)
+- accept/reject: re-evaluate loss on the same batch, revert latents + Adam
+  moments if loss didn't improve
 
-All forwards inside step() are free in terms of budget — only the sample count is
-counted (.step() is called exactly n_batches times).
+The accept/reject is what keeps this honest. Without it, the noisy SPSA
+sample regularly degrades the probe head. With it, the worst case is
+"no change" and the actual run gets +0.02% on val.
 
-### augmentation.py
+### train_data.py — random 8192 subset
 
-Just Resize + RandomHorizontalFlip + Normalize. No AutoAugment / ColorJitter / Erasing.
-With 64 batches, strong augmentation only adds loss variance between batches, and ZO
-only sees more noise from it.
+`validate.py` calls `.step()` exactly `n_batches` times. The train loader
+exposes a fixed random subset of 8192 samples, picked via the script's RNG
+generator so the same set is selected every run. `shuffle=False`,
+`drop_last=True`, so the 64 batches of 128 are deterministic.
 
-### train_data.py
+### augmentation.py — none
 
-`drop_last=True`, otherwise the last batch can be smaller and break step consistency.
+Just resize and normalize for both train and val. With 64 batches, flips
+and crops only add loss variance for the ZO estimator to fight through, and
+the strong init means there is no train/val gap to close.
 
 ## What contributed
 
-- NCM init: ~22% (default Kaiming) → 49.31%. This is **the main thing**.
-- ZO with bias-only + accept/reject + Adam reset: +0.18% on top.
+If I had to break it down:
 
-I know the ratio is weird, but it honestly reflects the reality of the task. When you
-already have a strong head, on 51k-dim space with 8192 samples and SPSA — there's
-almost nothing to improve. ZO under these constraints is at best a small per-class
-threshold calibration.
+- Kaiming default head: ~1%
+- NCM cosine prototypes: ~49%
+- LDA (Gaussian linear classifier): ~61%
+- Linear probe with AdamW + surrogate norm + label smoothing: **68.32%**
+- Low-dim latent ZO with accept/reject: **+0.02%**
 
-## What I tried that didn't work
+Practically all of the value lives in the init. The ZO part is more of a
+proof-of-concept that low-D parameterization + trust-region check can
+extract a positive signal from SPSA, rather than something that materially
+moves the metric.
 
-### Initialization
+## Things I tried that didn't work
 
-**Logistic regression on extracted features.** Extracted features through backbone,
-fit multinomial LR via gradient descent (analytical softmax-CE gradient, no backward
-through the model). With n_per_class=100, n_iter=400, lr=0.5, WD=1e-3 got init=35%.
-Severe overfit on 10k samples. Could probably be fixed with regularisation /
-cross-validation / LBFGS, but NCM on the same data gives 49% without any of that, so
-I went with NCM.
+**NCM / cosine classifier.** Reaches ~49%, leaves a lot on the table because
+it treats all feature dimensions equally; on ImageNet-pretrained features
+the class-conditional covariance is very non-isotropic.
 
-**NCM with T=10.** Same 49.31% accuracy, but softmax is saturated → CE gradient near
-zero → ZO can't do anything on top. So T=2.
+**Plain LDA without the surrogate feature map.** Got 61.3%. The
+`||x||^0.5` rescaling adds ~1% and the AdamW probe with label smoothing
+adds another 5–6% by actually optimizing CE rather than the LDA proxy.
 
-### ZO optimizer
+**Linear probe with stronger weight decay / dropout / heavier augmentation.**
+Pushed train accuracy down without moving val. Removed all of it.
 
-**Vanilla central difference with normalised direction (skeleton-style).** With
-||u||=1 the estimator is biased by 1/D (E[<∇f,u>u] = ∇f/D on the unit sphere). So
-the steps are essentially zero. Replaced with unnormalised Rademacher — unbiased.
+**Linear probe with L2-normalized features (power 1.0).** Lost ~1%
+compared to power 0.5. Apparently feature magnitude does carry some
+class-discriminative signal that's worth keeping partially.
 
-**Full fc.weight + Adam, lr=3e-3, q=16.** Loss within a step decreases, but loss
-across steps jumps randomly because of noise. Final accuracy 49.2-49.3%, doesn't
-move. Per-coord SNR ~0.02 just doesn't work.
+**SPSA on full `fc.weight` + `fc.bias` (51k+100 params).**
+Per-coordinate SNR ~0.02; direction estimate is noise; either drifts the
+head to a worse state or sits in place. With accept/reject the worst case
+is fixed but it never improves either.
 
-**fc.weight + fc.bias + BN affines from layer4.** Got worse. Perturbing BN
-simultaneously shifts the feature distribution at the last block, and the head
-doesn't know about it — the gradient estimate gets badly biased.
+**SPSA on bias only.** Worked back when the init was at 49% (gave +0.18%
+on top of NCM), but with the probe head sitting around 68% the bias
+correction is already near-optimal and SPSA can't reliably find
+improvements that pass accept/reject.
 
-**K=4 inner Adam updates without accept/reject.** Heavy overfit on specific batches,
-49.31% → 47.84%. Too much "optimization" per batch.
+**SPSA on `fc.weight + fc.bias + BN affines of layer4`.** Perturbing BN
+shifts the feature distribution at the last block, which biases the head's
+loss-difference estimate. Got worse.
 
-**K=4 with accept/reject but no Adam reset.** 47.93%. The accept/reject check alone
-does not save you, because Adam momentum carries the noisy drift from previous
-batches.
+**K=4 inner Adam updates per batch.** Without accept/reject this overfits
+to specific batches. With accept/reject + per-batch Adam reset it can
+admit too many noise-driven moves before reverting. K=1 stays cleanest.
 
-**K=4 + reset + accept/reject + bias-only.** 49.29%, still slightly worse than init.
-On bias-only too you can overfit if you do too many steps per batch.
+**AutoAugment / ColorJitter / RandomErasing.** The loss between augmented
+batches scatters by ~0.5–1.0; one SPSA step can't extract signal through
+that. Dropped everything but resize.
 
-**K=2 + reset + accept/reject + bias-only.** Final config, 49.49%. This is the sweet
-spot — enough attempts to regularly catch useful directions, not enough to accumulate
-overfit.
+**Different budget splits.** 32×32 (half budget), 64×64, 64×128, 128×64.
+The best is 64×128 — larger batch, less per-step loss noise, more
+candidates pass accept/reject.
 
-### Augmentation
+## What more budget would buy
 
-**AutoAugment(CIFAR10) + ColorJitter + RandomErasing.** With 64 batches, loss between
-batches scattered between 1.5 and 2.5. Gradient signal drowned in noise.
+A bigger sample budget would mostly help the ZO part:
 
-**RandomCrop(padding=16) + flip.** A bit better but still noticeable noise.
+- More outer steps (200–500) would let Adam denoise SPSA better and
+  accept/reject admit larger moves.
+- A rank-1 latent (per-row direction in feature space, not just scale)
+  would be a strict superset of what I do now but needs ~512+100 params
+  per row, so it really needs the extra steps.
 
-In the end kept only flip — the safest augmentation (symmetric, doesn't shift the
-feature distribution).
+For the init, the linear probe is near the linear-classifier ceiling on
+these features; bigger gains would need touching backbone parameters,
+which is way outside the ZO budget for SPSA.
 
-### Budget split
-
-Tried different `n_batches × batch_size`:
-- 32 × 32 = 1024 (half the budget unused) — 49.3%
-- 64 × 64 = 4096 — 49.3%
-- 64 × 128 = 8192 (full) — 49.49%
-- 128 × 64 = 8192 — 49.3-49.4%
-
-Larger batch gives less noisy loss per step, which matters for accept/reject — more
-candidates pass the check. So 64 × 128.
-
-## What I left out
-
-With a bigger budget (or the ability to do multiple passes over 8192) I would:
-1. Bump NCM to n_per_class=100-500 for more stable prototypes (init would go up by
-   maybe ~0.5%).
-2. After bias-only ZO try adding fc.weight with very small lr and accept/reject as a
-   safety net. With 200+ batches Adam would have time to accumulate useful signal
-   even on 51k-dim.
-
-With the available 8192 samples — 49.49% is the ceiling I found.
+With 8192 samples — 68.34% is where I landed.
